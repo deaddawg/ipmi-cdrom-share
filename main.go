@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf16"
 )
@@ -86,6 +87,145 @@ const (
 
 const maxBufferSize = 65536
 
+// readBufPool recycles buffers for READ_ANDX responses to avoid per-request allocations.
+// Each buffer is sized to hold: NetBIOS header(4) + SMB header(32) + WordCount(1) +
+// words(24) + ByteCount(2) + pad(1) + max file data.
+var readBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 4+32+1+24+2+1+maxBufferSize)
+		return &b
+	},
+}
+
+// debugStats tracks per-request performance metrics (lock-free via atomics).
+type debugStats struct {
+	requests  atomic.Int64
+	fileBytes atomic.Int64
+	handlerNs atomic.Int64 // total handler time (parse to write-complete)
+	ioNs      atomic.Int64 // time in ReadAt
+	writeNs   atomic.Int64 // time in conn.Write
+
+	// Handler latency histogram.
+	latUnder50us  atomic.Int64
+	latUnder200us atomic.Int64
+	latUnder1ms   atomic.Int64
+	latUnder5ms   atomic.Int64
+	latOver5ms    atomic.Int64
+
+	// Read size buckets.
+	sizeLE2K  atomic.Int64
+	sizeLE8K  atomic.Int64
+	sizeLE64K atomic.Int64
+	sizeGT64K atomic.Int64
+}
+
+func (d *debugStats) recordSize(n int) {
+	switch {
+	case n <= 2048:
+		d.sizeLE2K.Add(1)
+	case n <= 8192:
+		d.sizeLE8K.Add(1)
+	case n <= 65536:
+		d.sizeLE64K.Add(1)
+	default:
+		d.sizeGT64K.Add(1)
+	}
+}
+
+func (d *debugStats) recordLatency(ns int64) {
+	switch {
+	case ns < 50_000:
+		d.latUnder50us.Add(1)
+	case ns < 200_000:
+		d.latUnder200us.Add(1)
+	case ns < 1_000_000:
+		d.latUnder1ms.Add(1)
+	case ns < 5_000_000:
+		d.latUnder5ms.Add(1)
+	default:
+		d.latOver5ms.Add(1)
+	}
+}
+
+// runDebugDisplay prints a debug stats line to stderr every 2 seconds.
+func (d *debugStats) runDebugDisplay() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	var prevReqs, prevBytes, prevHandlerNs, prevIONs, prevWriteNs int64
+	var prevLat [5]int64 // <50us, <200us, <1ms, <5ms, >5ms
+	var prevSize [4]int64
+
+	for range ticker.C {
+		reqs := d.requests.Load()
+		bytes := d.fileBytes.Load()
+		handlerNs := d.handlerNs.Load()
+		ioNs := d.ioNs.Load()
+		writeNs := d.writeNs.Load()
+		lat := [5]int64{
+			d.latUnder50us.Load(), d.latUnder200us.Load(),
+			d.latUnder1ms.Load(), d.latUnder5ms.Load(), d.latOver5ms.Load(),
+		}
+		size := [4]int64{
+			d.sizeLE2K.Load(), d.sizeLE8K.Load(),
+			d.sizeLE64K.Load(), d.sizeGT64K.Load(),
+		}
+
+		dReqs := reqs - prevReqs
+		dBytes := bytes - prevBytes
+		dHandlerNs := handlerNs - prevHandlerNs
+		dIONs := ioNs - prevIONs
+		dWriteNs := writeNs - prevWriteNs
+		var dLat [5]int64
+		for i := range dLat {
+			dLat[i] = lat[i] - prevLat[i]
+		}
+		var dSize [4]int64
+		for i := range dSize {
+			dSize[i] = size[i] - prevSize[i]
+		}
+
+		prevReqs = reqs
+		prevBytes = bytes
+		prevHandlerNs = handlerNs
+		prevIONs = ioNs
+		prevWriteNs = writeNs
+		prevLat = lat
+		prevSize = size
+
+		if dReqs == 0 {
+			continue
+		}
+
+		reqsPerSec := float64(dReqs) / 2.0
+		mbPerSec := float64(dBytes) / 2.0 / float64(1<<20)
+		avgHandler := time.Duration(dHandlerNs / dReqs)
+		avgIO := time.Duration(dIONs / dReqs)
+		avgWrite := time.Duration(dWriteNs / dReqs)
+		avgOverhead := avgHandler - avgIO - avgWrite
+		avgSize := float64(dBytes) / float64(dReqs)
+
+		// Time between requests (inverse of req/s) vs handler time = idle%.
+		avgGapMs := 1000.0 / reqsPerSec
+		handlerMs := float64(avgHandler.Microseconds()) / 1000.0
+		idlePct := (1.0 - handlerMs/avgGapMs) * 100
+		if idlePct < 0 {
+			idlePct = 0
+		}
+
+		// Latency distribution as percentages.
+		latPct := func(i int) float64 {
+			return float64(dLat[i]) / float64(dReqs) * 100
+		}
+
+		log.Printf("[debug] %.0f req/s  %.1f MB/s  avg=%s  idle=%.0f%% | handler=%v io=%v write=%v overhead=%v | <50us:%.0f%% <200us:%.0f%% <1ms:%.0f%% <5ms:%.0f%% >5ms:%.0f%%",
+			reqsPerSec, mbPerSec, formatSize(int64(avgSize)), idlePct,
+			avgHandler.Round(time.Microsecond), avgIO.Round(time.Microsecond),
+			avgWrite.Round(time.Microsecond), avgOverhead.Round(time.Microsecond),
+			latPct(0), latPct(1), latPct(2), latPct(3), latPct(4))
+	}
+}
+
 // smbHeader is the 32-byte SMB1 header.
 type smbHeader struct {
 	command  uint8
@@ -117,6 +257,7 @@ type session struct {
 	fid      uint16
 	unicode  bool
 	progress *progress
+	debug    *debugStats // nil unless --debug
 }
 
 // readEvent is sent from handleRead to the progress display goroutine.
@@ -133,10 +274,11 @@ type speedSample struct {
 
 // progress tracks transfer state and renders a live terminal display.
 type progress struct {
-	fileSize int64
-	fileName string
-	events   chan readEvent
-	done     chan struct{}
+	fileSize  int64
+	fileName  string
+	events    chan readEvent
+	done      chan struct{}
+	debugMode bool // when true, use log lines instead of \r overwriting
 
 	mu     sync.Mutex
 	client string // last active client IP
@@ -186,9 +328,15 @@ func formatSpeed(bytesPerSec float64) string {
 	}
 }
 
-// run is the display goroutine. It renders a stats line to stderr every 250ms.
+// run is the display goroutine. It renders a stats line to stderr.
+// In normal mode: overwrites in place every 250ms.
+// In debug mode: prints a log line every 2s, suppressed when idle.
 func (p *progress) run() {
-	ticker := time.NewTicker(250 * time.Millisecond)
+	interval := 250 * time.Millisecond
+	if p.debugMode {
+		interval = 2 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	var (
@@ -201,7 +349,7 @@ func (p *progress) run() {
 	for {
 		select {
 		case <-p.done:
-			if started {
+			if started && !p.debugMode {
 				fmt.Fprintf(os.Stderr, "\r\033[K")
 			}
 			return
@@ -259,22 +407,42 @@ func (p *progress) run() {
 		client := p.client
 		p.mu.Unlock()
 
-		fmt.Fprintf(os.Stderr, "\r\033[K %s  %s  %s reads  %s transferred",
-			client, formatSpeed(speed), formatCount(totalReads), formatSize(totalBytes))
+		if p.debugMode {
+			// In debug mode, skip printing when idle (speed dropped to 0).
+			if speed == 0 && tickBytes == 0 {
+				continue
+			}
+			log.Printf("[stats] %s  %s  %s reads  %s transferred",
+				client, formatSpeed(speed), formatCount(totalReads), formatSize(totalBytes))
+		} else {
+			fmt.Fprintf(os.Stderr, "\r\033[K %s  %s  %s reads  %s transferred",
+				client, formatSpeed(speed), formatCount(totalReads), formatSize(totalBytes))
+		}
 	}
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <iso-path> [listen-addr]\n", os.Args[0])
+	// Parse --debug flag from args.
+	var debug bool
+	var args []string
+	for _, a := range os.Args[1:] {
+		if a == "--debug" {
+			debug = true
+		} else {
+			args = append(args, a)
+		}
+	}
+
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "Usage: %s [--debug] <iso-path> [listen-addr]\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Default listen address: :445\n")
 		os.Exit(1)
 	}
 
-	isoPath := os.Args[1]
+	isoPath := args[0]
 	listenAddr := ":445"
-	if len(os.Args) >= 3 {
-		listenAddr = os.Args[2]
+	if len(args) >= 2 {
+		listenAddr = args[1]
 	}
 
 	info, err := os.Stat(isoPath)
@@ -293,11 +461,19 @@ func main() {
 	log.Printf("Serving %s (%s) on smb://%s/share/%s",
 		filepath.Base(absPath), formatSize(info.Size()), listenAddr, filepath.Base(absPath))
 
+	var dbg *debugStats
+	if debug {
+		dbg = &debugStats{}
+		go dbg.runDebugDisplay()
+		log.Printf("[debug] Performance tracing enabled (2s intervals)")
+	}
+
 	prog := &progress{
-		fileSize: info.Size(),
-		fileName: filepath.Base(absPath),
-		events:   make(chan readEvent, 4096),
-		done:     make(chan struct{}),
+		fileSize:  info.Size(),
+		fileName:  filepath.Base(absPath),
+		events:    make(chan readEvent, 4096),
+		done:      make(chan struct{}),
+		debugMode: debug,
 	}
 	go prog.run()
 
@@ -313,12 +489,18 @@ func main() {
 			log.Printf("Accept error: %v", err)
 			continue
 		}
-		go handleConnection(conn, absPath, info.Size(), prog)
+		go handleConnection(conn, absPath, info.Size(), prog, dbg)
 	}
 }
 
-func handleConnection(conn net.Conn, isoPath string, fileSize int64, prog *progress) {
+func handleConnection(conn net.Conn, isoPath string, fileSize int64, prog *progress, dbg *debugStats) {
 	defer conn.Close()
+
+	// Disable Nagle's algorithm to avoid coalescing small writes.
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+
 	remote := conn.RemoteAddr().String()
 
 	// Extract just the IP (strip port).
@@ -349,6 +531,7 @@ func handleConnection(conn net.Conn, isoPath string, fileSize int64, prog *progr
 		tid:      1,
 		fid:      0x4000,
 		progress: prog,
+		debug:    dbg,
 	}
 
 	for {
@@ -377,6 +560,41 @@ func handleConnection(conn net.Conn, isoPath string, fileSize int64, prog *progr
 
 		if req.header.flags2&smbFlags2Unicode != 0 {
 			sess.unicode = true
+		}
+
+		// Fast path for READ_ANDX: build response in a single pooled buffer.
+		if req.header.command == smbComReadAndX {
+			var t0 time.Time
+			if sess.debug != nil {
+				t0 = time.Now()
+			}
+			wire, poolBuf, ioNs := handleReadFast(sess, req)
+			if wire != nil {
+				var writeStart time.Time
+				if sess.debug != nil {
+					writeStart = time.Now()
+				}
+				_, err := conn.Write(wire)
+				if sess.debug != nil {
+					writeNs := time.Since(writeStart).Nanoseconds()
+					totalNs := time.Since(t0).Nanoseconds()
+					dataLen := len(wire) - 64 // subtract headers
+					sess.debug.requests.Add(1)
+					sess.debug.fileBytes.Add(int64(dataLen))
+					sess.debug.handlerNs.Add(totalNs)
+					sess.debug.ioNs.Add(ioNs)
+					sess.debug.writeNs.Add(writeNs)
+					sess.debug.recordLatency(totalNs)
+					sess.debug.recordSize(dataLen)
+				}
+				readBufPool.Put(poolBuf)
+				if err != nil {
+					log.Printf("[%s] Write error: %v", remote, err)
+					return
+				}
+				continue
+			}
+			// Fall through to normal dispatch for error responses.
 		}
 
 		resp := dispatchCommand(sess, req)
@@ -416,20 +634,15 @@ func readNetBIOSPacket(r io.Reader) ([]byte, byte, error) {
 
 func writeNetBIOSPacket(w io.Writer, msgType byte, data []byte) error {
 	length := len(data)
-	hdr := []byte{
-		msgType,
-		byte(length >> 16),
-		byte(length >> 8),
-		byte(length),
-	}
-	if _, err := w.Write(hdr); err != nil {
-		return err
-	}
-	if len(data) > 0 {
-		_, err := w.Write(data)
-		return err
-	}
-	return nil
+	// Combine header + data into a single write to avoid multiple TCP segments.
+	buf := make([]byte, 4+length)
+	buf[0] = msgType
+	buf[1] = byte(length >> 16)
+	buf[2] = byte(length >> 8)
+	buf[3] = byte(length)
+	copy(buf[4:], data)
+	_, err := w.Write(buf)
+	return err
 }
 
 // --- SMB packet parse/build ---
@@ -747,14 +960,18 @@ func extractCreateFileName(sess *session, req *smbPacket) string {
 
 // --- READ_ANDX (0x2E) ---
 
-func handleRead(sess *session, req *smbPacket) *smbPacket {
+// handleReadFast builds the complete wire-format response (NetBIOS header + SMB + data)
+// in a single pooled buffer with zero intermediate allocations. It returns the raw bytes
+// to write and the pool buffer to recycle, or nil if the request should fall back to the
+// normal path (e.g. for error responses).
+func handleReadFast(sess *session, req *smbPacket) (wire []byte, poolBuf *[]byte, ioNs int64) {
 	if len(req.words) < 20 {
-		return errorResponse(req, statusInvalidHandle)
+		return nil, nil, 0
 	}
 
 	fid := binary.LittleEndian.Uint16(req.words[4:6])
 	if fid != sess.fid {
-		return errorResponse(req, statusInvalidHandle)
+		return nil, nil, 0
 	}
 
 	offsetLow := binary.LittleEndian.Uint32(req.words[6:10])
@@ -778,12 +995,30 @@ func handleRead(sess *session, req *smbPacket) *smbPacket {
 		maxCount = int(sess.fileSize - offset)
 	}
 
-	// Read file data.
-	buf := make([]byte, maxCount)
+	// Get a pooled buffer. Layout:
+	//   [0:4]     NetBIOS header
+	//   [4:36]    SMB header (32 bytes)
+	//   [36]      WordCount = 12
+	//   [37:61]   Words (24 bytes)
+	//   [61:63]   ByteCount
+	//   [63]      Pad byte
+	//   [64:]     File data
+	const hdrSize = 4 + 32 + 1 + 24 + 2 + 1 // = 64
+	bp := readBufPool.Get().(*[]byte)
+	buf := *bp
+
+	// Read file data directly into the final position.
 	n := 0
 	if maxCount > 0 {
+		var ioStart time.Time
+		if sess.debug != nil {
+			ioStart = time.Now()
+		}
 		var err error
-		n, err = sess.file.ReadAt(buf, offset)
+		n, err = sess.file.ReadAt(buf[hdrSize:hdrSize+maxCount], offset)
+		if sess.debug != nil {
+			ioNs = time.Since(ioStart).Nanoseconds()
+		}
 		if err != nil && err != io.EOF {
 			log.Printf("ReadAt error at offset %d: %v", offset, err)
 			n = 0
@@ -796,22 +1031,70 @@ func handleRead(sess *session, req *smbPacket) *smbPacket {
 		}
 	}
 
-	resp := newResponse(req)
-	resp.header.tid = req.header.tid
+	// Total SMB payload size (everything after NetBIOS header).
+	smbLen := 32 + 1 + 24 + 2 + 1 + n // = 60 + n
+	totalLen := 4 + smbLen
 
-	// WordCount = 12 (24 bytes).
-	words := make([]byte, 24)
+	// NetBIOS header.
+	buf[0] = 0x00
+	buf[1] = byte(smbLen >> 16)
+	buf[2] = byte(smbLen >> 8)
+	buf[3] = byte(smbLen)
+
+	// SMB header at offset 4.
+	smb := buf[4:]
+	smb[0] = 0xFF
+	smb[1] = 'S'
+	smb[2] = 'M'
+	smb[3] = 'B'
+	smb[4] = req.header.command
+	binary.LittleEndian.PutUint32(smb[5:9], statusOK)
+	smb[9] = smbFlagReply | (req.header.flags & smbFlagCaseless)
+	binary.LittleEndian.PutUint16(smb[10:12], req.header.flags2&(smbFlags2Unicode|smbFlags2NTStatus))
+	binary.LittleEndian.PutUint16(smb[12:14], req.header.pidHigh)
+	copy(smb[14:22], req.header.security[:])
+	smb[22] = 0
+	smb[23] = 0
+	binary.LittleEndian.PutUint16(smb[24:26], req.header.tid)
+	binary.LittleEndian.PutUint16(smb[26:28], req.header.pidLow)
+	binary.LittleEndian.PutUint16(smb[28:30], req.header.uid)
+	binary.LittleEndian.PutUint16(smb[30:32], req.header.mid)
+
+	// WordCount = 12.
+	smb[32] = 12
+
+	// Words at smb[33:57] (24 bytes).
+	words := smb[33:57]
+	// Zero out words region.
+	for i := range words {
+		words[i] = 0
+	}
 	words[0] = 0xFF // AndXCommand: none
 	binary.LittleEndian.PutUint16(words[4:6], 0xFFFF)     // Remaining
 	binary.LittleEndian.PutUint16(words[10:12], uint16(n)) // DataLength
-	// DataOffset: header(32) + WC(1) + words(24) + BC(2) + pad(1) = 60.
-	binary.LittleEndian.PutUint16(words[12:14], 60)
-	resp.words = words
+	binary.LittleEndian.PutUint16(words[12:14], 60)        // DataOffset
 
-	// Data: 1 pad byte + file data.
-	resp.data = make([]byte, 1+n)
-	copy(resp.data[1:], buf[:n])
-	return resp
+	// ByteCount = 1 (pad) + n.
+	binary.LittleEndian.PutUint16(smb[57:59], uint16(1+n))
+
+	// Pad byte.
+	smb[59] = 0x00
+
+	// File data is already at smb[60:60+n] from ReadAt above.
+
+	return buf[:totalLen], bp, ioNs
+}
+
+// handleRead is the fallback for error cases.
+func handleRead(sess *session, req *smbPacket) *smbPacket {
+	if len(req.words) < 20 {
+		return errorResponse(req, statusInvalidHandle)
+	}
+	fid := binary.LittleEndian.Uint16(req.words[4:6])
+	if fid != sess.fid {
+		return errorResponse(req, statusInvalidHandle)
+	}
+	return errorResponse(req, statusInvalidHandle)
 }
 
 // --- CLOSE (0x04) ---
