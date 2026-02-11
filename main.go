@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf16"
 )
@@ -115,6 +116,152 @@ type session struct {
 	tid      uint16
 	fid      uint16
 	unicode  bool
+	progress *progress
+}
+
+// readEvent is sent from handleRead to the progress display goroutine.
+type readEvent struct {
+	offset int64
+	size   int
+}
+
+// speedSample records bytes read at a point in time for throughput calculation.
+type speedSample struct {
+	when  time.Time
+	bytes int64
+}
+
+// progress tracks transfer state and renders a live terminal display.
+type progress struct {
+	fileSize int64
+	fileName string
+	events   chan readEvent
+	done     chan struct{}
+
+	mu     sync.Mutex
+	client string // last active client IP
+}
+
+// formatSize returns a human-readable size string.
+func formatSize(b int64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.1f GB", float64(b)/float64(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(b)/float64(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(b)/float64(1<<10))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
+}
+
+// formatCount returns an integer with comma separators (e.g. 1,204).
+func formatCount(n int64) string {
+	s := fmt.Sprintf("%d", n)
+	if len(s) <= 3 {
+		return s
+	}
+	var result []byte
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			result = append(result, ',')
+		}
+		result = append(result, byte(c))
+	}
+	return string(result)
+}
+
+// formatSpeed returns a human-readable speed string.
+func formatSpeed(bytesPerSec float64) string {
+	switch {
+	case bytesPerSec >= float64(1<<30):
+		return fmt.Sprintf("%.1f GB/s", bytesPerSec/float64(1<<30))
+	case bytesPerSec >= float64(1<<20):
+		return fmt.Sprintf("%.1f MB/s", bytesPerSec/float64(1<<20))
+	case bytesPerSec >= float64(1<<10):
+		return fmt.Sprintf("%.1f KB/s", bytesPerSec/float64(1<<10))
+	default:
+		return fmt.Sprintf("%.0f B/s", bytesPerSec)
+	}
+}
+
+// run is the display goroutine. It renders a stats line to stderr every 250ms.
+func (p *progress) run() {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	var (
+		speedBuf   []speedSample
+		totalReads int64
+		totalBytes int64
+		started    bool
+	)
+
+	for {
+		select {
+		case <-p.done:
+			if started {
+				fmt.Fprintf(os.Stderr, "\r\033[K")
+			}
+			return
+		case <-ticker.C:
+		}
+
+		// Drain all pending events.
+		var tickBytes int64
+		var tickReads int64
+		for {
+			select {
+			case ev := <-p.events:
+				tickBytes += int64(ev.size)
+				tickReads++
+			default:
+				goto drained
+			}
+		}
+	drained:
+
+		totalBytes += tickBytes
+		totalReads += tickReads
+
+		if tickBytes == 0 && !started {
+			continue
+		}
+
+		now := time.Now()
+		if tickBytes > 0 {
+			started = true
+			speedBuf = append(speedBuf, speedSample{when: now, bytes: tickBytes})
+		}
+
+		// Expire old speed samples (keep 2 seconds).
+		cutoff := now.Add(-2 * time.Second)
+		for len(speedBuf) > 0 && speedBuf[0].when.Before(cutoff) {
+			speedBuf = speedBuf[1:]
+		}
+
+		// Calculate speed.
+		var totalSpeedBytes int64
+		for _, s := range speedBuf {
+			totalSpeedBytes += s.bytes
+		}
+		var speed float64
+		if len(speedBuf) > 0 {
+			elapsed := now.Sub(speedBuf[0].when).Seconds()
+			if elapsed < 0.25 {
+				elapsed = 0.25
+			}
+			speed = float64(totalSpeedBytes) / elapsed
+		}
+
+		p.mu.Lock()
+		client := p.client
+		p.mu.Unlock()
+
+		fmt.Fprintf(os.Stderr, "\r\033[K %s  %s  %s reads  %s transferred",
+			client, formatSpeed(speed), formatCount(totalReads), formatSize(totalBytes))
+	}
 }
 
 func main() {
@@ -143,8 +290,16 @@ func main() {
 		log.Fatalf("Cannot resolve path: %v", err)
 	}
 
-	log.Printf("Serving %s (%d bytes) on smb://%s/share/%s",
-		absPath, info.Size(), listenAddr, filepath.Base(absPath))
+	log.Printf("Serving %s (%s) on smb://%s/share/%s",
+		filepath.Base(absPath), formatSize(info.Size()), listenAddr, filepath.Base(absPath))
+
+	prog := &progress{
+		fileSize: info.Size(),
+		fileName: filepath.Base(absPath),
+		events:   make(chan readEvent, 4096),
+		done:     make(chan struct{}),
+	}
+	go prog.run()
 
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -158,15 +313,26 @@ func main() {
 			log.Printf("Accept error: %v", err)
 			continue
 		}
-		go handleConnection(conn, absPath, info.Size())
+		go handleConnection(conn, absPath, info.Size(), prog)
 	}
 }
 
-func handleConnection(conn net.Conn, isoPath string, fileSize int64) {
+func handleConnection(conn net.Conn, isoPath string, fileSize int64, prog *progress) {
 	defer conn.Close()
 	remote := conn.RemoteAddr().String()
+
+	// Extract just the IP (strip port).
+	clientIP := remote
+	if host, _, err := net.SplitHostPort(remote); err == nil {
+		clientIP = host
+	}
+
 	log.Printf("[%s] Connected", remote)
 	defer log.Printf("[%s] Disconnected", remote)
+
+	prog.mu.Lock()
+	prog.client = clientIP
+	prog.mu.Unlock()
 
 	f, err := os.Open(isoPath)
 	if err != nil {
@@ -182,6 +348,7 @@ func handleConnection(conn net.Conn, isoPath string, fileSize int64) {
 		uid:      1,
 		tid:      1,
 		fid:      0x4000,
+		progress: prog,
 	}
 
 	for {
@@ -620,6 +787,12 @@ func handleRead(sess *session, req *smbPacket) *smbPacket {
 		if err != nil && err != io.EOF {
 			log.Printf("ReadAt error at offset %d: %v", offset, err)
 			n = 0
+		}
+		if n > 0 && sess.progress != nil {
+			select {
+			case sess.progress.events <- readEvent{offset: offset, size: n}:
+			default:
+			}
 		}
 	}
 
