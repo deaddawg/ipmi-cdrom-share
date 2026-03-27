@@ -1,1 +1,5 @@
 ipmi-cdrom-share
+testiso/*.efi
+testiso/*.o
+testiso/*.so
+testiso/*.iso
